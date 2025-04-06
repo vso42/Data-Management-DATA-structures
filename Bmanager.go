@@ -120,6 +120,21 @@ func (bm *BufferManager) UnpinPage(pageID PageID, isDirty bool) error {
 	return nil
 }
 
+func (bm *BufferManager) FlushPage(pageID PageID) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	if idx, exists := bm.pageTable[pageID]; exists {
+		frame := bm.frames[idx]
+		if frame.isDirty {
+			// Write to disk
+			bm.disk[pageID] = &frame.data
+			frame.isDirty = false
+		}
+	}
+	return nil
+}
+
 func (bm *BufferManager) NewPage() (PageID, *[PageSize]byte, error) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
