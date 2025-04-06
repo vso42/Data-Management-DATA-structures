@@ -14,6 +14,8 @@ const (
 	keySize            = 8
 	valueSize          = 8
 	ptrSize            = 8
+	maxLeafEntries     = (manager.PageSize - leafHeaderSize) / (keySize + valueSize)
+	maxInternalKeys    = (manager.PageSize - internalHeaderSize - ptrSize) / (keySize + ptrSize)
 )
 
 type BTree struct {
@@ -27,131 +29,319 @@ func NewBTree(bm *manager.BufferManager) *BTree {
 	return &BTree{bm: bm, rootPageID: rootID}
 }
 
-func initializeLeafPage(data []byte) {
+func initializeLeafPage(data *[manager.PageSize]byte) {
 	binary.BigEndian.PutUint64(data[0:8], leafNode)
-	binary.BigEndian.PutUint64(data[8:16], 0)  // numKeys = 0
-	binary.BigEndian.PutUint64(data[16:24], 0) // next = 0
-	binary.BigEndian.PutUint64(data[24:32], 0) // prev = 0
+	binary.BigEndian.PutUint64(data[8:16], 0)
+	binary.BigEndian.PutUint64(data[16:24], 0)
+	binary.BigEndian.PutUint64(data[24:32], 0)
 }
 
-func initializeInternalPage(data []byte) {
+func initializeInternalPage(data *[manager.PageSize]byte) {
 	binary.BigEndian.PutUint64(data[0:8], internalNode)
-	binary.BigEndian.PutUint64(data[8:16], 0) // numKeys = 0
+	binary.BigEndian.PutUint64(data[8:16], 0)
 }
 
+func (bt *BTree) Get(key uint64) (uint64, error) {
+	return bt.search(bt.rootPageID, key)
+}
+
+func (bt *BTree) search(pageID manager.PageID, key uint64) (uint64, error) {
+	data, err := bt.bm.PinPage(pageID)
+	if err != nil {
+		return 0, err
+	}
+	defer bt.bm.UnpinPage(pageID, false)
+
+	nodeType := binary.BigEndian.Uint64(data[0:8])
+	if nodeType == leafNode {
+		return bt.searchLeaf(data, key)
+	}
+	return bt.searchInternal(data, key)
+}
+
+func (bt *BTree) searchLeaf(data *[manager.PageSize]byte, key uint64) (uint64, error) {
+	numKeys := binary.BigEndian.Uint64(data[8:16])
+	low := 0
+	high := int(numKeys) - 1
+
+	for low <= high {
+		mid := (low + high) / 2
+		offset := leafHeaderSize + mid*(keySize+valueSize)
+		currentKey := binary.BigEndian.Uint64(data[offset:])
+
+		switch {
+		case key == currentKey:
+			return binary.BigEndian.Uint64(data[offset+keySize:]), nil
+		case key < currentKey:
+			high = mid - 1
+		default:
+			low = mid + 1
+		}
+	}
+	return 0, errors.New("key not found")
+}
+
+func (bt *BTree) searchInternal(data *[manager.PageSize]byte, key uint64) (uint64, error) {
+	numKeys := binary.BigEndian.Uint64(data[8:16])
+	low := 0
+	high := int(numKeys) - 1
+	childIndex := 0
+
+	for low <= high {
+		mid := (low + high) / 2
+		keyOffset := internalHeaderSize + mid*(ptrSize+keySize) + ptrSize
+		currentKey := binary.BigEndian.Uint64(data[keyOffset:])
+
+		if key < currentKey {
+			high = mid - 1
+			childIndex = mid
+		} else {
+			low = mid + 1
+			childIndex = mid + 1
+		}
+	}
+
+	ptrOffset := internalHeaderSize + childIndex*(ptrSize+keySize)
+	childID := manager.Unsizzle([8]byte(data[ptrOffset:]))
+	return bt.search(childID, key)
+}
+
+// Updated Insert implementation with full split propagation
 func (bt *BTree) Insert(key, value uint64) error {
-	return bt.insert(bt.rootPageID, key, value, nil, nil)
+	splitKey, newChild, err := bt.insert(bt.rootPageID, key, value)
+	if err != nil {
+		return err
+	}
+
+	// Handle root split
+	if newChild != 0 {
+		newRootID, rootData, _ := bt.bm.NewPage()
+		initializeInternalPage(rootData)
+
+		// Set first pointer to old root
+		copy(rootData[internalHeaderSize:], manager.Sizzle(bt.rootPageID))
+		// Set split key
+		binary.BigEndian.PutUint64(rootData[internalHeaderSize+ptrSize:], splitKey)
+		// Set second pointer to new child
+		copy(rootData[internalHeaderSize+ptrSize+keySize:], manager.Sizzle(newChild))
+
+		binary.BigEndian.PutUint64(rootData[8:16], 1) // numKeys = 1
+		bt.rootPageID = newRootID
+	}
+	return nil
 }
 
-func (bt *BTree) insert(pageID manager.PageID, key, value uint64, leftChild, rightChild *manager.PageID) error {
-	data, _ := bt.bm.PinPage(pageID)
+func (bt *BTree) insert(pageID manager.PageID, key, value uint64) (uint64, manager.PageID, error) {
+	data, err := bt.bm.PinPage(pageID)
+	if err != nil {
+		return 0, 0, err
+	}
 	defer bt.bm.UnpinPage(pageID, true)
 
 	nodeType := binary.BigEndian.Uint64(data[0:8])
 	if nodeType == leafNode {
 		return bt.insertLeaf(data, pageID, key, value)
-	} else {
-		return bt.insertInternal(data, pageID, key, value, leftChild, rightChild)
 	}
+	return bt.insertInternal(data, pageID, key, value)
 }
 
-func (bt *BTree) insertLeaf(data []byte, pageID manager.PageID, key, value uint64) error {
+func (bt *BTree) insertLeaf(data *[manager.PageSize]byte, pageID manager.PageID, key, value uint64) (uint64, manager.PageID, error) {
 	numKeys := binary.BigEndian.Uint64(data[8:16])
-	maxEntries := (PageSize - leafHeaderSize) / (keySize + valueSize)
+	insertPos := bt.findLeafInsertPosition(data, numKeys, key)
 
-	if numKeys < uint64(maxEntries) {
-		return bt.insertIntoLeaf(data, key, value)
-	}
-
-	// Split leaf
-	newPageID, newData, _ := bt.bm.NewPage()
-	initializeLeafPage(newData)
-
-	splitIndex := numKeys / 2
-	copy(newData[leafHeaderSize:], data[leafHeaderSize+splitIndex*(keySize+valueSize):])
-
-	// Update metadata
-	binary.BigEndian.PutUint64(newData[8:16], numKeys-splitIndex) // New numKeys
-	binary.BigEndian.PutUint64(data[8:16], splitIndex)            // Old numKeys
-
-	// Update linked list
-	nextPageID := binary.BigEndian.Uint64(data[16:24])
-	binary.BigEndian.PutUint64(newData[16:24], nextPageID)
-	binary.BigEndian.PutUint64(newData[24:32], uint64(pageID))
-	binary.BigEndian.PutUint64(data[16:24], uint64(newPageID))
-
-	// Insert split key into parent
-	splitKey := binary.BigEndian.Uint64(data[leafHeaderSize+splitIndex*(keySize+valueSize):])
-	return bt.insertIntoParent(pageID, splitKey, newPageID)
-}
-
-func (bt *BTree) insertIntoParent(oldPageID manager.PageID, splitKey uint64, newPageID manager.PageID) error {
-	parentPageID := bt.findParent(bt.rootPageID, oldPageID)
-	if parentPageID == 0 {
-		// Create new root
-		newRootID, newRootData, _ := bt.bm.NewPage()
-		initializeInternalPage(newRootData)
-		binary.BigEndian.PutUint64(newRootData[8:16], 1) // numKeys = 1
-		copy(newRootData[internalHeaderSize:], manager.Sizzle(oldPageID))
-		binary.BigEndian.PutUint64(newRootData[internalHeaderSize+ptrSize:], splitKey)
-		copy(newRootData[internalHeaderSize+ptrSize+keySize:], manager.Sizzle(newPageID))
-		bt.rootPageID = newRootID
-		return nil
-	}
-
-	data, _ := bt.bm.PinPage(parentPageID)
-	defer bt.bm.UnpinPage(parentPageID, true)
-
-	numKeys := binary.BigEndian.Uint64(data[8:16])
-	maxKeys := (PageSize - internalHeaderSize - ptrSize) / (keySize + ptrSize)
-
-	if numKeys < uint64(maxKeys) {
-		return bt.insertIntoInternal(data, parentPageID, splitKey, newPageID)
-	}
-
-	// Split internal node
-	newInternalID, newInternalData, _ := bt.bm.NewPage()
-	initializeInternalPage(newInternalData)
-
-	splitIndex := numKeys / 2
-	splitKeyInternal := binary.BigEndian.Uint64(data[internalHeaderSize+splitIndex*(ptrSize+keySize)+ptrSize:])
-
-	// Copy entries to new internal node
-	copy(newInternalData[internalHeaderSize:], data[internalHeaderSize+splitIndex*(ptrSize+keySize)+ptrSize+keySize:])
-	binary.BigEndian.PutUint64(newInternalData[8:16], numKeys-splitIndex-1)
-
-	// Update old internal node
-	binary.BigEndian.PutUint64(data[8:16], splitIndex)
-
-	// Promote splitKeyInternal
-	return bt.insertIntoParent(parentPageID, splitKeyInternal, newInternalID)
-}
-
-func (bt *BTree) insertIntoInternal(data []byte, parentPageID manager.PageID, splitKey uint64, newPageID manager.PageID) error {
-	numKeys := binary.BigEndian.Uint64(data[8:16])
-	insertIndex := 0
-
-	for ; insertIndex < int(numKeys); insertIndex++ {
-		offset := internalHeaderSize + insertIndex*(ptrSize+keySize) + ptrSize
-		currentKey := binary.BigEndian.Uint64(data[offset : offset+keySize])
-		if splitKey < currentKey {
-			break
+	// Update existing key if found
+	if insertPos < numKeys {
+		offset := leafHeaderSize + insertPos*(keySize+valueSize)
+		currentKey := binary.BigEndian.Uint64(data[offset:])
+		if currentKey == key {
+			binary.BigEndian.PutUint64(data[offset+keySize:], value)
+			return 0, 0, nil // No split needed
 		}
 	}
 
-	// Shift entries
-	startOffset := internalHeaderSize + insertIndex*(ptrSize+keySize)
-	bytesToShift := (int(numKeys) - insertIndex) * (ptrSize + keySize)
-	if bytesToShift > 0 {
-		copy(data[startOffset+(ptrSize+keySize):], data[startOffset:startOffset+bytesToShift])
+	if numKeys < maxLeafEntries {
+		bt.insertLeafEntry(data, numKeys, insertPos, key, value)
+		return 0, 0, nil
 	}
 
-	// Insert new child and key
-	copy(data[startOffset:], manager.Sizzle(newPageID))
-	binary.BigEndian.PutUint64(data[startOffset+ptrSize:], splitKey)
+	// Split required
+	newPageID, newData, _ := bt.bm.NewPage()
+	initializeLeafPage(newData)
+	splitPos := numKeys / 2
+	splitKey := binary.BigEndian.Uint64(data[leafHeaderSize+splitPos*(keySize+valueSize):])
 
+	// Split entries
+	bt.splitLeaf(data, newData, splitPos)
+
+	// Insert into appropriate node
+	if insertPos > splitPos {
+		bt.insertLeafEntry(newData, numKeys-splitPos, insertPos-splitPos, key, value)
+	} else {
+		bt.insertLeafEntry(data, splitPos, insertPos, key, value)
+	}
+
+	// Maintain linked list
+	nextPage := binary.BigEndian.Uint64(data[16:24])
+	binary.BigEndian.PutUint64(newData[16:24], nextPage)
+	binary.BigEndian.PutUint64(newData[24:32], uint64(pageID))
+	binary.BigEndian.PutUint64(data[16:24], uint64(newPageID))
+
+	return splitKey, newPageID, nil
+}
+
+func (bt *BTree) insertInternal(data *[manager.PageSize]byte, pageID manager.PageID, key, value uint64) (uint64, manager.PageID, error) {
+	numKeys := binary.BigEndian.Uint64(data[8:16])
+	insertPos := bt.findInternalInsertPosition(data, numKeys, key)
+
+	// Recurse to child
+	childOffset := internalHeaderSize + insertPos*(ptrSize+keySize)
+	childID := manager.Unsizzle([8]byte(data[childOffset:]))
+
+	promotedKey, newChild, err := bt.insert(childID, key, value)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if newChild == 0 {
+		return 0, 0, nil // No propagation needed
+	}
+
+	// Insert new key and pointer in internal node
+	if numKeys < maxInternalKeys {
+		bt.insertInternalEntry(data, numKeys, insertPos, promotedKey, newChild)
+		return 0, 0, nil
+	}
+
+	// Split internal node
+	newPageID, newData, _ := bt.bm.NewPage()
+	initializeInternalPage(newData)
+	splitPos := numKeys / 2
+	promotedSplitKey := bt.splitInternal(data, newData, splitPos)
+
+	// Determine where to insert
+	if insertPos > splitPos {
+		bt.insertInternalEntry(newData, numKeys-splitPos-1, insertPos-splitPos-1, promotedKey, newChild)
+	} else {
+		bt.insertInternalEntry(data, splitPos, insertPos, promotedKey, newChild)
+	}
+
+	return promotedSplitKey, newPageID, nil
+}
+
+//
+
+func (bt *BTree) findLeafInsertPosition(data *[manager.PageSize]byte, numKeys uint64, key uint64) uint64 {
+	low := 0
+	high := int(numKeys) - 1
+	var mid int
+
+	for low <= high {
+		mid = (low + high) / 2
+		offset := leafHeaderSize + mid*(keySize+valueSize)
+		currentKey := binary.BigEndian.Uint64(data[offset:])
+
+		switch {
+		case key == currentKey:
+			return uint64(mid)
+		case key < currentKey:
+			high = mid - 1
+		default:
+			low = mid + 1
+		}
+	}
+	return uint64(low)
+}
+
+func (bt *BTree) insertLeafEntry(data *[manager.PageSize]byte, numKeys, pos uint64, key, value uint64) error {
+	startOffset := leafHeaderSize + pos*(keySize+valueSize)
+	endOffset := leafHeaderSize + numKeys*(keySize+valueSize)
+	copy(data[startOffset+keySize+valueSize:], data[startOffset:endOffset])
+
+	binary.BigEndian.PutUint64(data[startOffset:], key)
+	binary.BigEndian.PutUint64(data[startOffset+keySize:], value)
 	binary.BigEndian.PutUint64(data[8:16], numKeys+1)
 	return nil
+}
+
+func (bt *BTree) splitLeaf(oldData, newData *[manager.PageSize]byte, splitPos uint64) {
+	copy(newData[leafHeaderSize:], oldData[leafHeaderSize+splitPos*(keySize+valueSize):])
+
+	oldNumKeys := binary.BigEndian.Uint64(oldData[8:16])
+	binary.BigEndian.PutUint64(oldData[8:16], splitPos)
+	binary.BigEndian.PutUint64(newData[8:16], oldNumKeys-splitPos)
+
+	// Update linked list
+	nextPage := binary.BigEndian.Uint64(oldData[16:24])
+	binary.BigEndian.PutUint64(newData[16:24], nextPage)
+	binary.BigEndian.PutUint64(newData[24:32], binary.BigEndian.Uint64(oldData[24:32]))
+	binary.BigEndian.PutUint64(oldData[16:24], binary.BigEndian.Uint64(newData[24:32]))
+}
+
+func (bt *BTree) insertInternal(data *[manager.PageSize]byte, pageID manager.PageID, key uint64, value uint64, newChildID manager.PageID) error {
+	numKeys := binary.BigEndian.Uint64(data[8:16])
+	insertPos := bt.findInternalInsertPosition(data, numKeys, key)
+
+	if numKeys < maxInternalKeys {
+		return bt.insertInternalEntry(data, numKeys, insertPos, key, newChildID)
+	}
+
+	newPageID, newData, _ := bt.bm.NewPage()
+	initializeInternalPage(newData)
+	splitPos := numKeys / 2
+	promotedKey := bt.splitInternal(data, newData, splitPos)
+
+	if insertPos > splitPos {
+		return bt.insertInternalEntry(newData, numKeys-splitPos-1, insertPos-splitPos-1, key, newChildID)
+	}
+	return bt.insertInternalEntry(data, splitPos, insertPos, key, newChildID)
+}
+
+func (bt *BTree) findInternalInsertPosition(data *[manager.PageSize]byte, numKeys uint64, key uint64) uint64 {
+	low := 0
+	high := int(numKeys) - 1
+	var pos int
+
+	for low <= high {
+		mid := (low + high) / 2
+		keyOffset := internalHeaderSize + mid*(ptrSize+keySize) + ptrSize
+		currentKey := binary.BigEndian.Uint64(data[keyOffset:])
+
+		switch {
+		case key < currentKey:
+			high = mid - 1
+			pos = mid
+		default:
+			low = mid + 1
+			pos = mid + 1
+		}
+	}
+	return uint64(pos)
+}
+
+func (bt *BTree) insertInternalEntry(data *[manager.PageSize]byte, numKeys, pos uint64, key uint64, childID manager.PageID) error {
+	startOffset := internalHeaderSize + pos*(ptrSize+keySize)
+	endOffset := internalHeaderSize + numKeys*(ptrSize+keySize)
+	copy(data[startOffset+ptrSize+keySize:], data[startOffset:endOffset])
+
+	copy(data[startOffset:], manager.Sizzle(childID))
+	binary.BigEndian.PutUint64(data[startOffset+ptrSize:], key)
+	binary.BigEndian.PutUint64(data[8:16], numKeys+1)
+	return nil
+}
+
+func (bt *BTree) splitInternal(oldData, newData *[manager.PageSize]byte, splitPos uint64) uint64 {
+	promotedKey := binary.BigEndian.Uint64(oldData[internalHeaderSize+splitPos*(ptrSize+keySize)+ptrSize:])
+
+	// Copy right entries
+	startOffset := internalHeaderSize + (splitPos+1)*(ptrSize+keySize)
+	copy(newData[internalHeaderSize:], oldData[startOffset:])
+
+	// Update counts
+	oldNumKeys := binary.BigEndian.Uint64(oldData[8:16])
+	binary.BigEndian.PutUint64(oldData[8:16], splitPos)
+	binary.BigEndian.PutUint64(newData[8:16], oldNumKeys-splitPos-1)
+
+	return promotedKey
 }
 
 func (bt *BTree) findParent(currentPageID, targetPageID manager.PageID) manager.PageID {
@@ -164,9 +354,9 @@ func (bt *BTree) findParent(currentPageID, targetPageID manager.PageID) manager.
 	}
 
 	numKeys := binary.BigEndian.Uint64(data[8:16])
-	for i := 0; i <= int(numKeys); i++ {
+	for i := uint64(0); i <= numKeys; i++ {
 		offset := internalHeaderSize + i*(ptrSize+keySize)
-		childID := manager.Unsizzle(data[offset : offset+ptrSize])
+		childID := manager.Unsizzle([8]byte(data[offset:]))
 		if childID == targetPageID {
 			return currentPageID
 		}
@@ -177,30 +367,23 @@ func (bt *BTree) findParent(currentPageID, targetPageID manager.PageID) manager.
 	return 0
 }
 
-func (bt *BTree) insertIntoLeaf(data []byte, key, value uint64) error {
-	numKeys := binary.BigEndian.Uint64(data[8:16])
-	insertIndex := 0
+func (bt *BTree) createNewRoot(leftChild, rightChild manager.PageID, key uint64) error {
+	newRootID, rootData, _ := bt.bm.NewPage()
+	initializeInternalPage(rootData)
 
-	for ; insertIndex < int(numKeys); insertIndex++ {
-		offset := leafHeaderSize + insertIndex*(keySize+valueSize)
-		currentKey := binary.BigEndian.Uint64(data[offset : offset+keySize])
-		if key < currentKey {
-			break
-		} else if key == currentKey {
-			return errors.New("duplicate key")
-		}
-	}
+	binary.BigEndian.PutUint64(rootData[8:16], 1)
+	copy(rootData[internalHeaderSize:], manager.Sizzle(leftChild))
+	binary.BigEndian.PutUint64(rootData[internalHeaderSize+ptrSize:], key)
+	copy(rootData[internalHeaderSize+ptrSize+keySize:], manager.Sizzle(rightChild))
 
-	// Shift entries
-	startOffset := leafHeaderSize + insertIndex*(keySize+valueSize)
-	bytesToShift := (int(numKeys) - insertIndex) * (keySize + valueSize)
-	if bytesToShift > 0 {
-		copy(data[startOffset+(keySize+valueSize):], data[startOffset:startOffset+bytesToShift])
-	}
-
-	// Insert new key-value
-	binary.BigEndian.PutUint64(data[startOffset:], key)
-	binary.BigEndian.PutUint64(data[startOffset+keySize:], value)
-	binary.BigEndian.PutUint64(data[8:16], numKeys+1)
+	bt.rootPageID = newRootID
 	return nil
+}
+
+func Sizzle(pageID manager.PageID) [8]byte {
+	return manager.Sizzle(pageID)
+}
+
+func Unsizzle(buf [8]byte) manager.PageID {
+	return manager.Unsizzle(buf)
 }
