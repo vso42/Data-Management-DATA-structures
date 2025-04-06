@@ -15,118 +15,146 @@ type PageID uint64
 
 type bufferPage struct {
 	pageID   PageID
-	data     []byte
+	data     [PageSize]byte
 	isDirty  bool
 	pinCount int
+	refbit   bool
 }
 
 type BufferManager struct {
-	disk       map[PageID][]byte
+	disk       map[PageID]*[PageSize]byte
 	frames     map[PageID]*bufferPage
-	freeList   []PageID
+	pageTable  map[PageID]int
+	clockHand  int
 	mu         sync.Mutex
 	nextPageID PageID
 }
 
 func NewBufferManager() *BufferManager {
-	return &BufferManager{
-		disk:     make(map[PageID][]byte),
-		frames:   make(map[PageID]*bufferPage),
-		freeList: make([]PageID, 0, MaxFrames),
+	bm := &BufferManager{
+		disk:      make(map[PageID]*[PageSize]byte),
+		frames:    make(map[PageID]*bufferPage),
+		pageTable: make(map[PageID]int),
 	}
+
+	for i := 0; i < MaxFrames; i++ {
+		bm.frames[i] = &bufferPage{}
+	}
+
+	return bm
 }
 
-func Sizzle(pageID PageID) []byte {
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(pageID))
-	return buf
-}
-
-func Unsizzle(buf []byte) PageID {
-	return PageID(binary.BigEndian.Uint64(buf))
-}
-
-func (bm *BufferManager) PinPage(pageID PageID) ([]byte, error) {
+func (bm *BufferManager) PinPage(pageID PageID) (*BufferPage, error) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
-	if page, exists := bm.frames[pageID]; exists {
-		page.pinCount++
-		return page.data, nil
+	if idx, exists := bm.pageTable[pageID]; exists {
+		frame := bm.frames[idx]
+		frame.pinCount++
+		frame.refBit = true
+		return frame, nil
 	}
 
 	data, exists := bm.disk[pageID]
 	if !exists {
-		data = make([]byte, PageSize)
+		return nil, errors.New("page does not exist")
 	}
 
-	bm.frames[pageID] = &bufferPage{
-		pageID:   pageID,
-		data:     data,
-		pinCount: 1,
+	victimIdx, err := bm.findVictim()
+	if err != nil {
+		return nil, errors.New("buffer full")
 	}
-	return data, nil
+	victim := bm.frames[victimIdx]
+
+	if victim.isDirty {
+		bm.disk[victim.pageID] = &victim.data
+	}
+
+	*victim = BufferPage{
+		pageID:   pageID,
+		data:     *data,
+		pinCount: 1,
+		refBit:   true,
+	}
+
+	delete(bm.pageTable, victim.pageID)
+	bm.pageTable[pageID] = victimIdx
+	return victim, nil
+}
+
+func (bm *BufferManager) findVictim() (int, error) {
+	for i := 0; i < 2*MaxFrames; i++ {
+		idx := (bm.clockHand + i) % MaxFrames
+		frame := bm.frames[idx]
+
+		if frame.pinCount > 0 {
+			continue
+		}
+
+		if frame.refBit {
+			frame.refBit = false
+			continue
+		}
+
+		bm.clockHand = (idx + 1) % MaxFrames
+		return idx, nil
+	}
+	return 0, errors.New("all pages pinned")
 }
 
 func (bm *BufferManager) UnpinPage(pageID PageID, isDirty bool) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
-	page, exists := bm.frames[pageID]
-	if !exists {
-		return errors.New("page not found")
-	}
-
-	page.pinCount--
-	page.isDirty = page.isDirty || isDirty
-
-	if page.pinCount == 0 {
-		bm.freeList = append(bm.freeList, pageID)
-	}
-	return nil
-}
-
-func (bm *BufferManager) FlushPage(pageID PageID) error {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	page, exists := bm.frames[pageID]
+	idx, exists := bm.pageTable[pageID]
 	if !exists {
 		return errors.New("page not in buffer")
 	}
 
-	bm.disk[pageID] = page.data
-	page.isDirty = false
+	frame := bm.frames[idx]
+	frame.pinCount--
+	if frame.pinCount < 0 {
+		panic("pin count negative")
+	}
+	frame.isDirty = frame.isDirty || isDirty
 	return nil
 }
 
-func (bm *BufferManager) NewPage() (PageID, []byte, error) {
+func (bm *BufferManager) NewPage() (PageID, *[PageSize]byte, error) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
 	pageID := bm.nextPageID
 	bm.nextPageID++
 
-	if len(bm.frames) >= MaxFrames {
-		if len(bm.freeList) == 0 {
-			return 0, nil, errors.New("buffer pool full")
-		}
-		evictID := bm.freeList[0]
-		bm.freeList = bm.freeList[1:]
-		if page, exists := bm.frames[evictID]; exists {
-			if page.isDirty {
-				bm.disk[evictID] = page.data
-			}
-			delete(bm.frames, evictID)
-		}
+	victimIdx, err := bm.findVictim()
+	if err != nil {
+		return 0, nil, errors.New("buffer full")
+	}
+	victim := bm.frames[victimIdx]
+
+	if victim.isDirty {
+		bm.disk[victim.pageID] = &victim.data
 	}
 
-	data := make([]byte, PageSize)
-	bm.frames[pageID] = &bufferPage{
+	*victim = BufferPage{
 		pageID:   pageID,
-		data:     data,
-		isDirty:  true,
 		pinCount: 1,
+		isDirty:  true,
+		refBit:   true,
 	}
-	return pageID, data, nil
+
+	delete(bm.pageTable, victim.pageID)
+	bm.pageTable[pageID] = victimIdx
+	return pageID, &victim.data, nil
+}
+
+func Sizzle(pageID PageID) [8]byte {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(pageID))
+	return buf
+}
+
+func Unsizzle(buf [8]byte) PageID {
+	return PageID(binary.BigEndian.Uint64(buf[:]))
 }
