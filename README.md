@@ -82,16 +82,5 @@ The implementations are optimized for:
 - Concurrent access (Split-Ordered List)
 - Fast search and retrieval operations
 
-## Requirements
 
-- Go 1.16 or higher
-- Sufficient disk space for B-tree operations
-- Memory for buffer management
 
-## License
-
-This project is open source and available under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. 
