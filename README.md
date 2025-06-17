@@ -6,13 +6,6 @@ This repository contains implementations of two important data structures: a B-t
 
 The B-tree implementation provides a disk-based B-tree data structure that supports efficient key-value storage and retrieval operations.
 
-### Features
-- Disk-based storage with buffer management
-- Support for both internal and leaf nodes
-- Efficient search, insert, and delete operations
-- Automatic node splitting and merging
-- Binary search for fast key lookups
-- Linked list structure for leaf nodes
 
 ### Key Components
 - `BtreeInterface.go`: Main interface and implementation of the B-tree operations
@@ -36,12 +29,6 @@ value, err := btree.Get(key)
 
 The Split-Ordered List is a concurrent hash table implementation that provides efficient insert, delete, and search operations with good scalability.
 
-### Features
-- Lock-free concurrent operations
-- Dynamic resizing
-- Efficient key distribution using bit reversal
-- Segment-based storage for better memory management
-- Constant-time average case operations
 
 ### Key Components
 - `splitordered.go`: Core implementation of the Split-Ordered List
@@ -63,24 +50,6 @@ exists := so.Contains(key)
 // Delete a key
 deleted := so.Delete(key)
 ```
-
-## Testing
-
-Both implementations come with comprehensive test suites:
-
-- B-tree tests verify the correctness of disk-based operations
-- Split-Ordered List tests include:
-  - Unit tests for basic operations
-  - Performance comparison tests
-  - Benchmark tests for measuring operation speeds
-
-## Performance
-
-The implementations are optimized for:
-- Memory efficiency
-- Disk I/O optimization (B-tree)
-- Concurrent access (Split-Ordered List)
-- Fast search and retrieval operations
 
 
 
